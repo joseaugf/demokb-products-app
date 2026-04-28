@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <title>Produtos</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; background: #0b1020; color: #e8ecf1; }
+      h1 { color: #7cc4ff; }
+      .card { background: #121833; padding: 1rem 1.25rem; border-radius: 8px; margin: .5rem 0; }
+      .price { color: #7be495; font-weight: 600; }
+      .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#1f2a55; font-size:.8rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Catálogo de Produtos</h1>
+    <p class="badge" id="envBadge">carregando…</p>
+    <div id="list"></div>
+    <script>
+      fetch('/health').then(r => r.json()).then(h => {
+        document.getElementById('envBadge').textContent = `env: ${h.env} • version: ${h.version}`;
+      });
+      fetch('/api/products').then(r => r.json()).then(items => {
+        document.getElementById('list').innerHTML = items.map(p => `
+          <div class="card">
+            <div><strong>${p.name}</strong></div>
+            <div class="price">R$ ${p.price.toFixed(2)}</div>
+          </div>
+        `).join('');
+      });
+    </script>
+  </body>
+</html>

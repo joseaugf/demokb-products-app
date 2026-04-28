@@ -1,0 +1,42 @@
+# Usado pelo CodeBuild em TODOS os estágios do pipeline.
+# Variáveis esperadas (setadas no CodePipeline/CodeBuild):
+#   AWS_DEFAULT_REGION    (ex.: us-east-1)
+#   AWS_ACCOUNT_ID
+#   IMAGE_REPO_NAME       (nome do repo ECR, ex.: products-app)
+#   CONTAINER_NAME        (nome do container na task def, ex.: app)
+#   TARGET_ENV            (dev | qa | prod) - usado como tag adicional e APP_ENV
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "[pre_build] Logging in to Amazon ECR..."
+      - aws --version
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+      - COMMIT_HASH=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - REPOSITORY_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME"
+      - echo "REPOSITORY_URI=$REPOSITORY_URI"
+      - echo "IMAGE_TAG=$IMAGE_TAG  TARGET_ENV=$TARGET_ENV"
+
+  build:
+    commands:
+      - echo "[build] Building Docker image..."
+      - docker build -t "$REPOSITORY_URI:$IMAGE_TAG" .
+      - docker tag "$REPOSITORY_URI:$IMAGE_TAG" "$REPOSITORY_URI:$TARGET_ENV"
+
+  post_build:
+    commands:
+      - echo "[post_build] Pushing image to ECR..."
+      - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+      - docker push "$REPOSITORY_URI:$TARGET_ENV"
+      - echo "[post_build] Writing imagedefinitions.json for ECS deploy action..."
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$REPOSITORY_URI:$IMAGE_TAG" > imagedefinitions.json
+      - cat imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
+    - appspec.yaml
+    - taskdef.json
+  discard-paths: yes

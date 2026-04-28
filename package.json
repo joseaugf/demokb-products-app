@@ -1,0 +1,17 @@
+{
+  "name": "products-app",
+  "version": "0.1.0",
+  "description": "Sample products page - monolith Node.js",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

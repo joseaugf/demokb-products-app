@@ -1,0 +1,32 @@
+{
+  "family": "REPLACE_FAMILY",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "REPLACE_EXECUTION_ROLE_ARN",
+  "taskRoleArn": "REPLACE_TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "REPLACE_IMAGE_URI",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 3000, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "APP_ENV",     "value": "REPLACE_APP_ENV" },
+        { "name": "APP_VERSION", "value": "REPLACE_APP_VERSION" },
+        { "name": "PORT",        "value": "3000" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "REPLACE_LOG_GROUP",
+          "awslogs-region": "REPLACE_REGION",
+          "awslogs-stream-prefix": "app"
+        }
+      }
+    }
+  ]
+}
