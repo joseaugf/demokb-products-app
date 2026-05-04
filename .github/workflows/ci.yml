@@ -1,0 +1,39 @@
+name: CI (feature -> develop)
+
+# Roda em:
+# - qualquer PR que tenha develop como base (ex.: feature/*, hotfix/* -> develop)
+# - push direto em feature/** (opcional, ajuda dev a ver o CI sem abrir PR)
+on:
+  pull_request:
+    branches: [ develop ]
+  push:
+    branches: [ 'feature/**', 'hotfix/**', 'bugfix/**' ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run tests
+        run: npm test --if-present
+
+      - name: Docker build (no push, just validate)
+        run: docker build -t ci-build:${{ github.sha }} .
