@@ -1,0 +1,310 @@
+name: Deploy
+
+# Workflow consolidado:
+#   - feature: develop -> qa -> main -> prod (com Kiro review e approvals)
+#   - hotfix:  hotfix/* (de main) -> main -> prod (1 approval) + back-merge main->develop
+#   - rollback: aplica imagem antiga em prod (sem build, com 1 approval)
+#
+# Disparo:
+#   - push em develop = fluxo feature (auto)
+#   - workflow_dispatch via UI = qualquer fluxo (escolhe nos inputs)
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Tipo de operação"
+        required: true
+        type: choice
+        options:
+          - feature
+          - hotfix
+          - rollback
+      image_tag:
+        description: "(rollback) Tag da imagem ECR para promover a prod"
+        required: false
+        type: string
+        default: ""
+      hotfix_branch:
+        description: "(hotfix) Nome da branch hotfix/* (já criada de main, com PR aberto para main)"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: [ develop ]
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: kabum-poc-cluster
+  CONTAINER_NAME: app
+  APP_NAME: ${{ github.event.repository.name }}
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: deploy-${{ github.event.repository.name }}
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  # 0. Decide qual fluxo rodar
+  # =========================================================================
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      operation: ${{ steps.set.outputs.operation }}
+      image_tag: ${{ steps.set.outputs.image_tag }}
+      hotfix_branch: ${{ steps.set.outputs.hotfix_branch }}
+    steps:
+      - id: set
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "operation=feature" >> "$GITHUB_OUTPUT"
+          else
+            echo "operation=${{ github.event.inputs.operation }}" >> "$GITHUB_OUTPUT"
+            echo "image_tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "hotfix_branch=${{ github.event.inputs.hotfix_branch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # =========================================================================
+  # FLUXO FEATURE
+  # =========================================================================
+  feature-build:
+    needs: decide
+    if: needs.decide.outputs.operation == 'feature'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.build.outputs.tag }}
+      commit_sha: ${{ steps.build.outputs.sha }}
+      repo_uri: ${{ steps.build.outputs.repo_uri }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & Push image
+        id: build
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          TAG="${SHA:0:12}"
+          REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" \
+            --query 'repositories[0].repositoryUri' --output text)
+          docker build -t "$REPO_URI:$TAG" -t "$REPO_URI:latest" .
+          docker push "$REPO_URI:$TAG"
+          docker push "$REPO_URI:latest"
+          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"        >> "$GITHUB_OUTPUT"
+          echo "repo_uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+
+  feature-deploy-dev:
+    needs: [ decide, feature-build ]
+    if: needs.decide.outputs.operation == 'feature'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy ${{ env.APP_NAME }}-dev
+        run: |
+          ./.github/scripts/deploy-ecs-image.sh \
+            "${APP_NAME}-dev" \
+            "${{ needs.feature-build.outputs.repo_uri }}:${{ needs.feature-build.outputs.image_tag }}"
+
+  feature-kiro-review:
+    needs: [ decide, feature-deploy-dev, feature-build ]
+    if: needs.decide.outputs.operation == 'feature'
+    uses: ./.github/workflows/kiro-review.yml
+    with:
+      commit_sha: ${{ needs.feature-build.outputs.commit_sha }}
+      image_tag:  ${{ needs.feature-build.outputs.image_tag }}
+    secrets: inherit
+
+  feature-deploy-qa:
+    needs: [ decide, feature-build, feature-kiro-review ]
+    if: needs.decide.outputs.operation == 'feature'
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy ${{ env.APP_NAME }}-qa
+        run: |
+          ./.github/scripts/deploy-ecs-image.sh \
+            "${APP_NAME}-qa" \
+            "${{ needs.feature-build.outputs.repo_uri }}:${{ needs.feature-build.outputs.image_tag }}"
+
+  feature-promote-prod:
+    needs: [ decide, feature-build, feature-deploy-qa ]
+    if: needs.decide.outputs.operation == 'feature'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT_FOR_MERGE }}
+      - name: Merge develop -> main
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/${{ needs.feature-build.outputs.image_tag }}"
+          git checkout -b "$BRANCH" origin/develop
+          git push origin "$BRANCH"
+          PR_URL=$(gh pr create --base main --head "$BRANCH" \
+            --title "release: ${{ needs.feature-build.outputs.image_tag }}" \
+            --body "Automated release PR after QA approval. Image: ${{ needs.feature-build.outputs.image_tag }}")
+          PR_NUM=$(echo "$PR_URL" | sed -E 's|.*/pull/([0-9]+).*|\1|')
+          gh pr merge "$PR_NUM" --squash --delete-branch
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy ${{ env.APP_NAME }}-prod
+        run: |
+          ./.github/scripts/deploy-ecs-image.sh \
+            "${APP_NAME}-prod" \
+            "${{ needs.feature-build.outputs.repo_uri }}:${{ needs.feature-build.outputs.image_tag }}"
+
+  # =========================================================================
+  # FLUXO HOTFIX
+  # =========================================================================
+  hotfix-deploy:
+    needs: decide
+    if: needs.decide.outputs.operation == 'hotfix'
+    runs-on: ubuntu-latest
+    environment: prod-hotfix
+    outputs:
+      image_tag: ${{ steps.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.decide.outputs.hotfix_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT_FOR_MERGE }}
+
+      - name: Validate branch is from main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "::error::A branch hotfix deve descender de main"
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push image
+        id: build
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          TAG="hotfix-${SHA:0:12}"
+          REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" \
+            --query 'repositories[0].repositoryUri' --output text)
+          docker build -t "$REPO_URI:$TAG" .
+          docker push "$REPO_URI:$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "repo_uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Merge hotfix -> main
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
+        run: |
+          set -euo pipefail
+          PR_NUM=$(gh pr list --base main --head "${{ needs.decide.outputs.hotfix_branch }}" \
+            --json number --jq '.[0].number')
+          if [[ -z "$PR_NUM" ]]; then
+            echo "::error::Nenhum PR aberto da branch ${{ needs.decide.outputs.hotfix_branch }} para main"
+            exit 1
+          fi
+          gh pr merge "$PR_NUM" --squash --delete-branch
+
+      - name: Deploy ${{ env.APP_NAME }}-prod
+        run: |
+          ./.github/scripts/deploy-ecs-image.sh \
+            "${APP_NAME}-prod" \
+            "${{ steps.build.outputs.repo_uri }}:${{ steps.build.outputs.tag }}"
+
+      - name: Backmerge PR main -> develop
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
+        run: |
+          set -euo pipefail
+          BACKMERGE="backmerge/${{ steps.build.outputs.tag }}"
+          git fetch origin main develop
+          git checkout -b "$BACKMERGE" origin/main
+          git push origin "$BACKMERGE"
+          gh pr create --base develop --head "$BACKMERGE" \
+            --title "backmerge: ${{ steps.build.outputs.tag }} (main -> develop)" \
+            --body "Hotfix aplicado em prod. Sincronizando main para develop. Resolva conflitos se houver."
+
+  # =========================================================================
+  # FLUXO ROLLBACK
+  # =========================================================================
+  rollback:
+    needs: decide
+    if: needs.decide.outputs.operation == 'rollback'
+    runs-on: ubuntu-latest
+    environment: prod-rollback
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT_FOR_MERGE }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate image tag exists in ECR
+        id: validate
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.decide.outputs.image_tag }}"
+          if [[ -z "$TAG" ]]; then
+            echo "::error::image_tag é obrigatório para rollback"
+            exit 1
+          fi
+          aws ecr describe-images --repository-name "$APP_NAME" \
+            --image-ids imageTag="$TAG" >/dev/null
+          REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" \
+            --query 'repositories[0].repositoryUri' --output text)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "repo_uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Apply rollback to prod
+        run: |
+          ./.github/scripts/deploy-ecs-image.sh \
+            "${APP_NAME}-prod" \
+            "${{ steps.validate.outputs.repo_uri }}:${{ steps.validate.outputs.tag }}"
+
+      - name: Tag commit as rollback marker
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y%m%d-%H%M%S)
+          TAG_NAME="rollback-to-${{ steps.validate.outputs.tag }}-${DATE}"
+          git fetch origin main
+          git tag "$TAG_NAME" origin/main \
+            -m "Rollback prod to ${{ steps.validate.outputs.tag }} on ${DATE} by ${{ github.actor }}"
+          git push origin "$TAG_NAME"
