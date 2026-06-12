@@ -48,9 +48,22 @@ jobs:
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
 
       - name: Install Kiro CLI
+        id: install
+        continue-on-error: true
         run: |
-          curl -fsSL https://kiro.dev/install.sh | bash
-          echo "$HOME/.kiro/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          # POC: Kiro CLI install sem login publico ainda nao disponivel.
+          # Caminho: usar Strands Agents SDK (mais barato, mesmo Bedrock) ou
+          # quando Kiro CLI release for publica, trocar este step.
+          # Por ora, falha esperada e proximo step gera report mock.
+          if curl -fsSL "https://cli.kiro.dev/install.sh" -o /tmp/kiro-install.sh; then
+            bash /tmp/kiro-install.sh
+            echo "$HOME/.kiro/bin" >> "$GITHUB_PATH"
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Kiro CLI install endpoint nao disponivel ainda; gerando review mock."
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Compute diff develop..qa
         id: diff
@@ -80,8 +93,28 @@ jobs:
         id: review
         env:
           KIRO_API_KEY: ${{ steps.kiro.outputs.key }}
+          KIRO_INSTALLED: ${{ steps.install.outputs.installed }}
         run: |
           set -euo pipefail
+          if [[ "${KIRO_INSTALLED}" != "true" ]]; then
+            cat > /tmp/kiro-report.md <<EOF
+          ## Sumário
+          (POC) Kiro CLI ainda não está disponível publicamente para instalação automatizada.
+          Diff em \`/tmp/kiro-context/changes.diff\` ($(wc -l < /tmp/kiro-context/changes.diff) linhas).
+          Arquivos alterados ($(wc -l < /tmp/kiro-context/changed-files.txt)):
+
+          \`\`\`
+          $(cat /tmp/kiro-context/changed-files.txt)
+          \`\`\`
+
+          ## Veredito
+          VEREDITO: WARN (Kiro CLI install pendente — review manual recomendado)
+          EOF
+            echo "verdict=VEREDITO: WARN (Kiro CLI install pendente)" >> "$GITHUB_OUTPUT"
+            echo "report_path=/tmp/kiro-report.md" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           PROMPT=$(cat <<'EOF'
           Você é um senior software engineer fazendo code review automatizado de um deploy.
           Estamos no momento entre develop e qa. Analise o diff em /tmp/kiro-context/changes.diff
@@ -130,7 +163,6 @@ jobs:
             }
 
           echo "report_path=/tmp/kiro-report.md" >> "$GITHUB_OUTPUT"
-          # Extrai apenas a linha do veredito
           VEREDITO=$(grep -oE 'VEREDITO: (OK|WARN|BLOCK)[^$]*' /tmp/kiro-report.md | head -1 || echo "VEREDITO: WARN (sem veredito)")
           echo "verdict=$VEREDITO" >> "$GITHUB_OUTPUT"
 

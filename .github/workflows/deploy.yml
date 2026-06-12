@@ -174,9 +174,9 @@ jobs:
         run: |
           set -euo pipefail
           TOKEN=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
-            --query "stageStates[?stageName=='Approval_To_QA'].actionStates[?actionName=='Manual_Approval_QA'].latestExecution.token | [0][0]" \
-            --output text)
-          if [[ -z "$TOKEN" || "$TOKEN" == "None" ]]; then
+            --query "stageStates[?stageName=='Approval_To_QA']" --output json \
+            | jq -r '.[0].actionStates[] | select(.actionName=="Manual_Approval_QA") | .latestExecution.token // empty')
+          if [[ -z "$TOKEN" ]]; then
             echo "::error::Token de approval não encontrado"
             exit 1
           fi
@@ -252,8 +252,12 @@ jobs:
         run: |
           set -euo pipefail
           TOKEN=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
-            --query "stageStates[?stageName=='Approval_To_Main_PR'].actionStates[?actionName=='Manual_Approval_Open_PR'].latestExecution.token | [0][0]" \
-            --output text)
+            --query "stageStates[?stageName=='Approval_To_Main_PR']" --output json \
+            | jq -r '.[0].actionStates[] | select(.actionName=="Manual_Approval_Open_PR") | .latestExecution.token // empty')
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::Token de approval (prod) não encontrado"
+            exit 1
+          fi
           aws codepipeline put-approval-result \
             --pipeline-name "$PIPELINE" \
             --stage-name Approval_To_Main_PR \
