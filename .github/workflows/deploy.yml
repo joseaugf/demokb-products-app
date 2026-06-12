@@ -1,13 +1,18 @@
 name: Deploy
 
-# Workflow consolidado:
-#   - feature: develop -> qa -> main -> prod (com Kiro review e approvals)
-#   - hotfix:  hotfix/* (de main) -> main -> prod (1 approval) + back-merge main->develop
-#   - rollback: aplica imagem antiga em prod (sem build, com 1 approval)
+# Caminho B: GitHub Actions = orquestrador, CodePipeline = deploy worker.
 #
-# Disparo:
-#   - push em develop = fluxo feature (auto)
-#   - workflow_dispatch via UI = qualquer fluxo (escolhe nos inputs)
+# Como funciona:
+#   - O CodePipeline `<app>-devqa` é disparado por push em develop (trigger nativo CodeStar).
+#   - Este workflow OBSERVA a execução do pipeline AWS:
+#     * Quando o pipeline atinge "Approval_To_QA" (Pending), o workflow trava no Environment
+#       "qa" do GitHub. Quando o reviewer aprova lá, o workflow chama put-approval-result
+#       no CodePipeline e o pipeline destrava.
+#     * Mesma coisa pra "Approval_To_Main_PR" (Environment "prod").
+#   - Após Open_PR (lambda do CodePipeline criar PR develop->main), este workflow merja o PR
+#     e chama o pipeline `<app>-prod` via start-pipeline-execution.
+#
+# Hotfix / rollback continuam sendo workflow_dispatch e fazem o caminho mais direto.
 
 on:
   workflow_dispatch:
@@ -21,12 +26,12 @@ on:
           - hotfix
           - rollback
       image_tag:
-        description: "(rollback) Tag da imagem ECR para promover a prod"
+        description: "(rollback) Tag da imagem ECR (vazio = lista 20 últimas)"
         required: false
         type: string
         default: ""
       hotfix_branch:
-        description: "(hotfix) Nome da branch hotfix/* (já criada de main, com PR aberto para main)"
+        description: "(hotfix) Nome da branch hotfix/* já criada de main com PR para main"
         required: false
         type: string
         default: ""
@@ -50,9 +55,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # =========================================================================
-  # 0. Decide qual fluxo rodar
-  # =========================================================================
   decide:
     runs-on: ubuntu-latest
     outputs:
@@ -71,115 +73,231 @@ jobs:
           fi
 
   # =========================================================================
-  # FLUXO FEATURE
+  # FLUXO FEATURE (CodePipeline-driven)
   # =========================================================================
-  feature-build:
+
+  # Job 1: encontra a execução do CodePipeline disparada pelo push em develop
+  #        e aguarda chegar em Approval_To_QA.
+  feature-wait-qa-approval:
     needs: decide
     if: needs.decide.outputs.operation == 'feature'
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.build.outputs.tag }}
-      commit_sha: ${{ steps.build.outputs.sha }}
-      repo_uri: ${{ steps.build.outputs.repo_uri }}
+      execution_id: ${{ steps.find.outputs.execution_id }}
+      commit_sha: ${{ steps.find.outputs.commit_sha }}
     steps:
-      - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - uses: aws-actions/amazon-ecr-login@v2
-      - name: Build & Push image
-        id: build
+
+      - name: Find CodePipeline execution for this commit
+        id: find
         run: |
           set -euo pipefail
-          SHA=$(git rev-parse HEAD)
-          TAG="${SHA:0:12}"
-          REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" \
-            --query 'repositories[0].repositoryUri' --output text)
-          docker build -t "$REPO_URI:$TAG" -t "$REPO_URI:latest" .
-          docker push "$REPO_URI:$TAG"
-          docker push "$REPO_URI:latest"
-          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA"        >> "$GITHUB_OUTPUT"
-          echo "repo_uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+          COMMIT="${{ github.sha }}"
+          PIPELINE="${APP_NAME}-devqa"
+          echo "Looking for pipeline execution for commit ${COMMIT:0:12}…"
 
-  feature-deploy-dev:
-    needs: [ decide, feature-build ]
-    if: needs.decide.outputs.operation == 'feature'
-    runs-on: ubuntu-latest
-    environment: dev
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-      - name: Deploy ${{ env.APP_NAME }}-dev
+          # Tenta por até 5 min localizar a execução com esse commit.
+          for attempt in $(seq 1 30); do
+            EXEC_ID=$(aws codepipeline list-pipeline-executions \
+              --pipeline-name "$PIPELINE" --max-items 5 \
+              --query "pipelineExecutionSummaries[?starts_with(sourceRevisions[0].revisionId, '$COMMIT') || sourceRevisions[0].revisionId == '$COMMIT'].pipelineExecutionId | [0]" \
+              --output text)
+            if [[ -n "$EXEC_ID" && "$EXEC_ID" != "None" ]]; then
+              echo "Found: $EXEC_ID"
+              echo "execution_id=$EXEC_ID" >> "$GITHUB_OUTPUT"
+              echo "commit_sha=$COMMIT"   >> "$GITHUB_OUTPUT"
+              break
+            fi
+            echo "  not yet (attempt $attempt/30), sleeping 10s…"
+            sleep 10
+          done
+          if [[ -z "${EXEC_ID:-}" || "$EXEC_ID" == "None" ]]; then
+            echo "::error::Pipeline execution não encontrada para $COMMIT"
+            exit 1
+          fi
+
+      - name: Wait until Approval_To_QA is Pending
+        env:
+          PIPELINE: ${{ env.APP_NAME }}-devqa
+          EXEC: ${{ steps.find.outputs.execution_id }}
         run: |
-          ./.github/scripts/deploy-ecs-image.sh \
-            "${APP_NAME}-dev" \
-            "${{ needs.feature-build.outputs.repo_uri }}:${{ needs.feature-build.outputs.image_tag }}"
+          set -euo pipefail
+          echo "Waiting for stage Approval_To_QA to reach 'InProgress' (pending approval)…"
+          for attempt in $(seq 1 60); do
+            STATE=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
+              --query "stageStates[?stageName=='Approval_To_QA'].latestExecution.status | [0]" \
+              --output text)
+            STAGE_EXEC=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
+              --query "stageStates[?stageName=='Approval_To_QA'].latestExecution.pipelineExecutionId | [0]" \
+              --output text)
+            echo "  attempt $attempt: state=$STATE exec=$STAGE_EXEC"
 
-  feature-kiro-review:
-    needs: [ decide, feature-deploy-dev, feature-build ]
-    if: needs.decide.outputs.operation == 'feature'
-    uses: ./.github/workflows/kiro-review.yml
-    with:
-      commit_sha: ${{ needs.feature-build.outputs.commit_sha }}
-      image_tag:  ${{ needs.feature-build.outputs.image_tag }}
-    secrets: inherit
+            # Confirma que o estado pertence a NOSSA execução
+            if [[ "$STAGE_EXEC" == "$EXEC" && "$STATE" == "InProgress" ]]; then
+              echo "Approval pending."
+              exit 0
+            fi
+            if [[ "$STATE" == "Failed" || "$STATE" == "Cancelled" ]]; then
+              echo "::error::Pipeline stage failed/cancelled before reaching approval"
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::Timeout aguardando Approval_To_QA"
+          exit 1
 
-  feature-deploy-qa:
-    needs: [ decide, feature-build, feature-kiro-review ]
-    if: needs.decide.outputs.operation == 'feature'
+  # Job 2: Environment "qa" — required reviewer aprova aqui no GitHub.
+  #        Quando o reviewer aprova, este job chama put-approval-result no CodePipeline
+  #        e o estágio Approval_To_QA do CodePipeline destrava.
+  feature-approve-qa:
+    needs: [ feature-wait-qa-approval ]
     runs-on: ubuntu-latest
     environment: qa
     steps:
-      - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Deploy ${{ env.APP_NAME }}-qa
+      - name: Send Approved to CodePipeline
+        env:
+          PIPELINE: ${{ env.APP_NAME }}-devqa
+          EXEC: ${{ needs.feature-wait-qa-approval.outputs.execution_id }}
         run: |
-          ./.github/scripts/deploy-ecs-image.sh \
-            "${APP_NAME}-qa" \
-            "${{ needs.feature-build.outputs.repo_uri }}:${{ needs.feature-build.outputs.image_tag }}"
+          set -euo pipefail
+          TOKEN=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
+            --query "stageStates[?stageName=='Approval_To_QA'].actionStates[?actionName=='Manual_Approval_QA'].latestExecution.token | [0][0]" \
+            --output text)
+          if [[ -z "$TOKEN" || "$TOKEN" == "None" ]]; then
+            echo "::error::Token de approval não encontrado"
+            exit 1
+          fi
+          aws codepipeline put-approval-result \
+            --pipeline-name "$PIPELINE" \
+            --stage-name Approval_To_QA \
+            --action-name Manual_Approval_QA \
+            --token "$TOKEN" \
+            --result summary="Approved via GitHub Environment by ${{ github.actor }}",status=Approved
+          echo "Approved."
 
-  feature-promote-prod:
-    needs: [ decide, feature-build, feature-deploy-qa ]
-    if: needs.decide.outputs.operation == 'feature'
+  # Job 3: Kiro review entre Deploy_Dev e Approval_To_QA.
+  #        Como Approval_To_QA já aconteceu, vai rodar em paralelo com o Deploy_QA do CodePipeline.
+  feature-kiro-review:
+    needs: [ feature-wait-qa-approval ]
+    uses: ./.github/workflows/kiro-review.yml
+    with:
+      commit_sha: ${{ needs.feature-wait-qa-approval.outputs.commit_sha }}
+      image_tag:  ${{ needs.feature-wait-qa-approval.outputs.commit_sha }}
+    secrets: inherit
+
+  # Job 4: aguarda Approval_To_Main_PR ficar pending
+  feature-wait-prod-approval:
+    needs: [ feature-approve-qa ]
+    runs-on: ubuntu-latest
+    outputs:
+      execution_id: ${{ needs.feature-wait-qa-approval.outputs.execution_id }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Wait until Approval_To_Main_PR is Pending
+        env:
+          PIPELINE: ${{ env.APP_NAME }}-devqa
+          EXEC: ${{ needs.feature-wait-qa-approval.outputs.execution_id }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            STATE=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
+              --query "stageStates[?stageName=='Approval_To_Main_PR'].latestExecution.status | [0]" \
+              --output text)
+            STAGE_EXEC=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
+              --query "stageStates[?stageName=='Approval_To_Main_PR'].latestExecution.pipelineExecutionId | [0]" \
+              --output text)
+            echo "  attempt $attempt: state=$STATE exec=$STAGE_EXEC"
+            if [[ "$STAGE_EXEC" == "$EXEC" && "$STATE" == "InProgress" ]]; then
+              exit 0
+            fi
+            if [[ "$STATE" == "Failed" || "$STATE" == "Cancelled" ]]; then
+              echo "::error::Pipeline stage failed/cancelled before reaching prod approval"
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::Timeout aguardando Approval_To_Main_PR"
+          exit 1
+
+  # Job 5: Environment "prod" — required reviewer aprova abertura de PR develop->main.
+  feature-approve-prod:
+    needs: [ feature-wait-prod-approval, feature-wait-qa-approval ]
     runs-on: ubuntu-latest
     environment: prod
     steps:
-      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          fetch-depth: 0
-          token: ${{ secrets.GH_PAT_FOR_MERGE }}
-      - name: Merge develop -> main
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send Approved to CodePipeline
+        env:
+          PIPELINE: ${{ env.APP_NAME }}-devqa
+          EXEC: ${{ needs.feature-wait-qa-approval.outputs.execution_id }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(aws codepipeline get-pipeline-state --name "$PIPELINE" \
+            --query "stageStates[?stageName=='Approval_To_Main_PR'].actionStates[?actionName=='Manual_Approval_Open_PR'].latestExecution.token | [0][0]" \
+            --output text)
+          aws codepipeline put-approval-result \
+            --pipeline-name "$PIPELINE" \
+            --stage-name Approval_To_Main_PR \
+            --action-name Manual_Approval_Open_PR \
+            --token "$TOKEN" \
+            --result summary="Approved via GitHub Environment by ${{ github.actor }}",status=Approved
+          echo "Approved. Lambda OpenPR vai criar o PR develop->main."
+
+  # Job 6: aguarda PR develop->main ser criado pela Lambda OpenPR, merja, dispara <app>-prod
+  feature-merge-and-deploy-prod:
+    needs: [ feature-approve-prod ]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for develop->main PR
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
         run: |
           set -euo pipefail
-          BRANCH="release/${{ needs.feature-build.outputs.image_tag }}"
-          git checkout -b "$BRANCH" origin/develop
-          git push origin "$BRANCH"
-          PR_URL=$(gh pr create --base main --head "$BRANCH" \
-            --title "release: ${{ needs.feature-build.outputs.image_tag }}" \
-            --body "Automated release PR after QA approval. Image: ${{ needs.feature-build.outputs.image_tag }}")
-          PR_NUM=$(echo "$PR_URL" | sed -E 's|.*/pull/([0-9]+).*|\1|')
-          gh pr merge "$PR_NUM" --squash --delete-branch
+          for attempt in $(seq 1 30); do
+            PR_NUM=$(gh pr list --repo "${{ github.repository }}" --base main --state open \
+              --json number,headRefName --jq '[.[] | select(.headRefName=="qa")][0].number')
+            if [[ -n "${PR_NUM:-}" && "$PR_NUM" != "null" ]]; then
+              echo "PR encontrada: #$PR_NUM"
+              echo "PR_NUM=$PR_NUM" >> "$GITHUB_ENV"
+              break
+            fi
+            echo "  PR ainda não criada, aguardando…"
+            sleep 10
+          done
+          if [[ -z "${PR_NUM:-}" || "$PR_NUM" == "null" ]]; then
+            echo "::error::PR develop->main não foi criada pela Lambda OpenPR"
+            exit 1
+          fi
 
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+      - name: Merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
+        run: gh pr merge --repo "${{ github.repository }}" "$PR_NUM" --merge
 
-      - name: Deploy ${{ env.APP_NAME }}-prod
+      - name: Trigger prod pipeline
         run: |
-          ./.github/scripts/deploy-ecs-image.sh \
-            "${APP_NAME}-prod" \
-            "${{ needs.feature-build.outputs.repo_uri }}:${{ needs.feature-build.outputs.image_tag }}"
+          set -euo pipefail
+          aws codepipeline start-pipeline-execution \
+            --name "${APP_NAME}-prod" --query 'pipelineExecutionId' --output text
 
   # =========================================================================
   # FLUXO HOTFIX
@@ -189,8 +307,6 @@ jobs:
     if: needs.decide.outputs.operation == 'hotfix'
     runs-on: ubuntu-latest
     environment: prod-hotfix
-    outputs:
-      image_tag: ${{ steps.build.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -198,64 +314,44 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_PAT_FOR_MERGE }}
 
-      - name: Validate branch is from main
+      - name: Validate branch
         run: |
           set -euo pipefail
           git fetch origin main
           if ! git merge-base --is-ancestor origin/main HEAD; then
-            echo "::error::A branch hotfix deve descender de main"
-            exit 1
+            echo "::error::A branch hotfix deve descender de main"; exit 1
           fi
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-      - uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build & Push image
-        id: build
-        run: |
-          set -euo pipefail
-          SHA=$(git rev-parse HEAD)
-          TAG="hotfix-${SHA:0:12}"
-          REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" \
-            --query 'repositories[0].repositoryUri' --output text)
-          docker build -t "$REPO_URI:$TAG" .
-          docker push "$REPO_URI:$TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "repo_uri=$REPO_URI" >> "$GITHUB_OUTPUT"
 
       - name: Merge hotfix -> main
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
         run: |
           set -euo pipefail
-          PR_NUM=$(gh pr list --base main --head "${{ needs.decide.outputs.hotfix_branch }}" \
-            --json number --jq '.[0].number')
-          if [[ -z "$PR_NUM" ]]; then
-            echo "::error::Nenhum PR aberto da branch ${{ needs.decide.outputs.hotfix_branch }} para main"
-            exit 1
-          fi
-          gh pr merge "$PR_NUM" --squash --delete-branch
+          PR_NUM=$(gh pr list --repo "${{ github.repository }}" --base main \
+            --head "${{ needs.decide.outputs.hotfix_branch }}" --json number --jq '.[0].number')
+          [[ -n "$PR_NUM" && "$PR_NUM" != "null" ]] || { echo "::error::PR não encontrada"; exit 1; }
+          gh pr merge --repo "${{ github.repository }}" "$PR_NUM" --squash --delete-branch
 
-      - name: Deploy ${{ env.APP_NAME }}-prod
-        run: |
-          ./.github/scripts/deploy-ecs-image.sh \
-            "${APP_NAME}-prod" \
-            "${{ steps.build.outputs.repo_uri }}:${{ steps.build.outputs.tag }}"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Trigger prod pipeline (CodeBuild builda hotfix em main)
+        run: aws codepipeline start-pipeline-execution --name "${APP_NAME}-prod"
 
       - name: Backmerge PR main -> develop
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_MERGE }}
         run: |
           set -euo pipefail
-          BACKMERGE="backmerge/${{ steps.build.outputs.tag }}"
+          DATE=$(date -u +%Y%m%d-%H%M%S)
+          BACKMERGE="backmerge/hotfix-${DATE}"
           git fetch origin main develop
           git checkout -b "$BACKMERGE" origin/main
           git push origin "$BACKMERGE"
-          gh pr create --base develop --head "$BACKMERGE" \
-            --title "backmerge: ${{ steps.build.outputs.tag }} (main -> develop)" \
+          gh pr create --repo "${{ github.repository }}" --base develop --head "$BACKMERGE" \
+            --title "backmerge: hotfix ${DATE} (main -> develop)" \
             --body "Hotfix aplicado em prod. Sincronizando main para develop. Resolva conflitos se houver."
 
   # =========================================================================
@@ -275,23 +371,19 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validate image tag exists in ECR
+      - name: Validate image tag
         id: validate
         run: |
           set -euo pipefail
           TAG="${{ needs.decide.outputs.image_tag }}"
-          if [[ -z "$TAG" ]]; then
-            echo "::error::image_tag é obrigatório para rollback"
-            exit 1
-          fi
-          aws ecr describe-images --repository-name "$APP_NAME" \
-            --image-ids imageTag="$TAG" >/dev/null
+          [[ -n "$TAG" ]] || { echo "::error::image_tag obrigatório"; exit 1; }
+          aws ecr describe-images --repository-name "$APP_NAME" --image-ids imageTag="$TAG" >/dev/null
           REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" \
             --query 'repositories[0].repositoryUri' --output text)
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "repo_uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "repo_uri=$REPO_URI"  >> "$GITHUB_OUTPUT"
 
-      - name: Apply rollback to prod
+      - name: Apply rollback to prod via ECS
         run: |
           ./.github/scripts/deploy-ecs-image.sh \
             "${APP_NAME}-prod" \
