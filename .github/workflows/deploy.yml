@@ -99,25 +99,28 @@ jobs:
           PIPELINE="${APP_NAME}-devqa"
           echo "Looking for pipeline execution for commit ${COMMIT:0:12}…"
 
-          # Tenta por até 5 min localizar a execução com esse commit.
+          EXEC_ID=""
           for attempt in $(seq 1 30); do
-            EXEC_ID=$(aws codepipeline list-pipeline-executions \
+            CANDIDATE=$(aws codepipeline list-pipeline-executions \
               --pipeline-name "$PIPELINE" --max-items 5 \
-              --query "pipelineExecutionSummaries[?starts_with(sourceRevisions[0].revisionId, '$COMMIT') || sourceRevisions[0].revisionId == '$COMMIT'].pipelineExecutionId | [0]" \
-              --output text)
-            if [[ -n "$EXEC_ID" && "$EXEC_ID" != "None" ]]; then
+              --query "pipelineExecutionSummaries[?starts_with(sourceRevisions[0].revisionId, '$COMMIT') || sourceRevisions[0].revisionId == '$COMMIT'] | [0].pipelineExecutionId" \
+              --output text 2>/dev/null || true)
+            if [[ -n "$CANDIDATE" && "$CANDIDATE" != "None" ]]; then
+              EXEC_ID="$CANDIDATE"
               echo "Found: $EXEC_ID"
-              echo "execution_id=$EXEC_ID" >> "$GITHUB_OUTPUT"
-              echo "commit_sha=$COMMIT"   >> "$GITHUB_OUTPUT"
               break
             fi
             echo "  not yet (attempt $attempt/30), sleeping 10s…"
             sleep 10
           done
-          if [[ -z "${EXEC_ID:-}" || "$EXEC_ID" == "None" ]]; then
-            echo "::error::Pipeline execution não encontrada para $COMMIT"
+
+          if [[ -z "$EXEC_ID" ]]; then
+            echo "::error::Pipeline execution não encontrada para $COMMIT após 5min"
             exit 1
           fi
+
+          echo "execution_id=$EXEC_ID" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT"   >> "$GITHUB_OUTPUT"
 
       - name: Wait until Approval_To_QA is Pending
         env:
