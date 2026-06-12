@@ -200,7 +200,7 @@ jobs:
 
   # Job 4: aguarda Approval_To_Main_PR ficar pending
   feature-wait-prod-approval:
-    needs: [ feature-approve-qa ]
+    needs: [ feature-approve-qa, feature-wait-qa-approval ]
     runs-on: ubuntu-latest
     outputs:
       execution_id: ${{ needs.feature-wait-qa-approval.outputs.execution_id }}

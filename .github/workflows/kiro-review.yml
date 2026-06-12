@@ -169,9 +169,11 @@ jobs:
       - name: Upload report to S3
         run: |
           DATE=$(date -u +%Y/%m/%d)
+          BUCKET="demokb-deploy-reports-$(aws sts get-caller-identity --query Account --output text)"
           KEY="reviews/${APP_NAME}/${DATE}/${{ inputs.image_tag }}.md"
-          aws s3 cp /tmp/kiro-report.md "s3://demokb-deploy-reports/${KEY}"
-          echo "Report URL: https://s3.${AWS_REGION}.amazonaws.com/demokb-deploy-reports/${KEY}"
+          aws s3 cp /tmp/kiro-report.md "s3://${BUCKET}/${KEY}"
+          echo "Report URL: https://s3.${AWS_REGION}.amazonaws.com/${BUCKET}/${KEY}"
+          echo "S3_BUCKET=$BUCKET" >> "$GITHUB_ENV"
           echo "S3_KEY=$KEY" >> "$GITHUB_ENV"
 
       - name: Comment on related PR (if any)
@@ -188,7 +190,7 @@ jobs:
 
           ${{ steps.review.outputs.verdict }}
 
-          [Relatório completo](https://s3.${AWS_REGION}.amazonaws.com/demokb-deploy-reports/${S3_KEY})
+          [Relatório completo](https://s3.${AWS_REGION}.amazonaws.com/${S3_BUCKET}/${S3_KEY})
 
           <details><summary>Ver inline</summary>
 
