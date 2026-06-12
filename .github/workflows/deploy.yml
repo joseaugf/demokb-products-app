@@ -102,9 +102,9 @@ jobs:
           EXEC_ID=""
           for attempt in $(seq 1 30); do
             CANDIDATE=$(aws codepipeline list-pipeline-executions \
-              --pipeline-name "$PIPELINE" --max-items 5 \
+              --pipeline-name "$PIPELINE" --max-items 5 --no-paginate \
               --query "pipelineExecutionSummaries[?starts_with(sourceRevisions[0].revisionId, '$COMMIT') || sourceRevisions[0].revisionId == '$COMMIT'] | [0].pipelineExecutionId" \
-              --output text 2>/dev/null || true)
+              --output text 2>/dev/null | head -n1 || true)
             if [[ -n "$CANDIDATE" && "$CANDIDATE" != "None" ]]; then
               EXEC_ID="$CANDIDATE"
               echo "Found: $EXEC_ID"
