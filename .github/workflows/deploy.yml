@@ -101,11 +101,14 @@ jobs:
 
           EXEC_ID=""
           for attempt in $(seq 1 30); do
+            # Pega 1 página inteira (10 últimas execuções) em JSON e filtra com jq.
+            # Isso evita o problema de --max-items emitir 'None' na próxima página.
             CANDIDATE=$(aws codepipeline list-pipeline-executions \
-              --pipeline-name "$PIPELINE" --max-items 5 --no-paginate \
-              --query "pipelineExecutionSummaries[?starts_with(sourceRevisions[0].revisionId, '$COMMIT') || sourceRevisions[0].revisionId == '$COMMIT'] | [0].pipelineExecutionId" \
-              --output text 2>/dev/null | head -n1 || true)
-            if [[ -n "$CANDIDATE" && "$CANDIDATE" != "None" ]]; then
+              --pipeline-name "$PIPELINE" \
+              --query 'pipelineExecutionSummaries[].{id:pipelineExecutionId,rev:sourceRevisions[0].revisionId}' \
+              --output json 2>/dev/null \
+              | jq -r --arg c "$COMMIT" '[.[] | select(.rev != null and (.rev == $c or (.rev | startswith($c))))][0].id // empty')
+            if [[ -n "$CANDIDATE" ]]; then
               EXEC_ID="$CANDIDATE"
               echo "Found: $EXEC_ID"
               break
