@@ -108,7 +108,8 @@ phases:
     commands:
       - echo "==> Uploading report to S3"
       - DATE=$(date -u +%Y/%m/%d)
-      - SHORT_ID="${COMMIT_ID:0:12}"
+      - SHORT_ID="${COMMIT_ID:-unknown}"
+      - SHORT_ID="${SHORT_ID:0:12}"
       - KEY="reviews/${APP_NAME}/${DATE}/${SHORT_ID}.md"
       - |
         if [ -n "$REPORTS_BUCKET" ]; then
