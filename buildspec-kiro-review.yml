@@ -24,14 +24,14 @@ phases:
       - curl -fsSL https://cli.kiro.dev/install -o /tmp/kiro-install.sh
       - bash /tmp/kiro-install.sh
       - export PATH="$HOME/.local/bin:$PATH"
-      - which kiro-cli || { echo "::error:: kiro-cli não foi instalado"; exit 1; }
+      - which kiro-cli || { echo "kiro-cli nao foi instalado"; exit 1; }
       - kiro-cli --version
 
   pre_build:
     commands:
       - echo "==> Loading Kiro API key"
       - export KIRO_API_KEY="$(aws secretsmanager get-secret-value --secret-id "$KIRO_API_KEY_SECRET" --query SecretString --output text)"
-      - test -n "$KIRO_API_KEY" || { echo "::error:: KIRO_API_KEY vazio"; exit 1; }
+      - test -n "$KIRO_API_KEY" || { echo "KIRO_API_KEY vazio"; exit 1; }
       - echo "==> Preparing diff context"
       - mkdir -p /tmp/kiro-context
       # CodePipeline já fez checkout do branch source (develop). Pega o diff contra qa.
@@ -117,10 +117,11 @@ phases:
         else
           echo "==> REPORTS_BUCKET not set; skipping S3 upload"
         fi
-      - echo "==> Veredito:"
-      - grep -oE 'VEREDITO: (OK|WARN|BLOCK)[^$]*' /tmp/kiro-report.md | head -1 || echo "VEREDITO: WARN (no veredito found)"
-      - echo "==> First 80 lines of report:"
-      - head -80 /tmp/kiro-report.md
+      - |
+        echo "==> Veredito:"
+        grep -oE 'VEREDITO: (OK|WARN|BLOCK)[^$]*' /tmp/kiro-report.md | head -1 || echo "VEREDITO: WARN (no veredito found)"
+        echo "==> First 80 lines of report:"
+        head -80 /tmp/kiro-report.md
 
 artifacts:
   files:
