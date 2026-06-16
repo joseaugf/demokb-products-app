@@ -1,0 +1,76 @@
+version: 0.2
+
+# Buildspec usado pelo CodeBuild project ${AppName}-rollback dentro do
+# CodePipeline ${AppName}-rollback.
+#
+# Variáveis vindas do Project + EnvironmentVariables override no action:
+#   APP_NAME, AWS_DEFAULT_REGION, CONTAINER_NAME, CLUSTER_NAME, SERVICE_NAME
+#   IMAGE_TAG  (override pelo pipeline com #{variables.ImageTag})
+#   APPLY      (override pelo segundo action: "true" só no Deploy_Rollback_Final)
+#
+# Modo dry-run (APPLY != "true"):
+#   - Valida que IMAGE_TAG existe no ECR
+#   - Imprime resumo (TD atual, TD nova proposta)
+#   - Não muda nada
+#
+# Modo apply (APPLY == "true"):
+#   - Registra nova task definition apontando IMAGE_TAG
+#   - Atualiza ECS service prod
+#   - Aguarda estabilização
+
+env:
+  shell: bash
+
+phases:
+  install:
+    commands:
+      - echo "==> Validating tools"
+      - aws --version
+      - jq --version
+
+  pre_build:
+    commands:
+      - echo "==> Inputs"
+      - echo "    APP_NAME      $APP_NAME"
+      - echo "    IMAGE_TAG     $IMAGE_TAG"
+      - echo "    SERVICE       $SERVICE_NAME"
+      - echo "    CLUSTER       $CLUSTER_NAME"
+      - echo "    APPLY         ${APPLY:-false}"
+      - test -n "$IMAGE_TAG" || { echo "IMAGE_TAG vazio"; exit 1; }
+      - test "$IMAGE_TAG" != "unset" || { echo "IMAGE_TAG ainda nao foi setado pelo pipeline"; exit 1; }
+
+  build:
+    commands:
+      - echo "==> Validating image exists in ECR"
+      - aws ecr describe-images --repository-name "$APP_NAME" --image-ids imageTag="$IMAGE_TAG" >/dev/null
+      - REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" --query 'repositories[0].repositoryUri' --output text)
+      - IMAGE_URI="${REPO_URI}:${IMAGE_TAG}"
+      - echo "    ImageUri       $IMAGE_URI"
+      - |
+        echo "==> Current task definition"
+        aws ecs describe-task-definition --task-definition "$SERVICE_NAME" \
+          --query 'taskDefinition.{revision:revision,arn:taskDefinitionArn,image:containerDefinitions[?name==`'"$CONTAINER_NAME"'`].image | [0]}' \
+          --output table
+      - |
+        if [ "${APPLY:-false}" != "true" ]; then
+          echo "==> DRY RUN — image $IMAGE_TAG validated; no changes applied"
+          exit 0
+        fi
+      - |
+        echo "==> APPLYING rollback"
+        CURRENT_TD_JSON=$(aws ecs describe-task-definition --task-definition "$SERVICE_NAME" --query 'taskDefinition' --output json)
+        NEW_TD=$(echo "$CURRENT_TD_JSON" | jq --arg img "$IMAGE_URI" --arg cn "$CONTAINER_NAME" '
+          .containerDefinitions |= map(if .name == $cn then .image = $img else . end)
+          | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+        ')
+        echo "$NEW_TD" > /tmp/new-td.json
+        NEW_ARN=$(aws ecs register-task-definition --cli-input-json "file:///tmp/new-td.json" --query 'taskDefinition.taskDefinitionArn' --output text)
+        echo "    NewTd          $NEW_ARN"
+        aws ecs update-service --cluster "$CLUSTER_NAME" --service "$SERVICE_NAME" --task-definition "$NEW_ARN" \
+          --query 'service.{name:serviceName,td:taskDefinition,desired:desiredCount,running:runningCount}' --output table
+        echo "==> Waiting for service to stabilize"
+        aws ecs wait services-stable --cluster "$CLUSTER_NAME" --services "$SERVICE_NAME"
+        echo "==> Rollback applied successfully"
+
+artifacts:
+  files: []
