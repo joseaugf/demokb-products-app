@@ -34,12 +34,37 @@ phases:
       - test -n "$KIRO_API_KEY" || { echo "KIRO_API_KEY vazio"; exit 1; }
       - echo "==> Preparing diff context"
       - mkdir -p /tmp/kiro-context
-      - 'git log -1 --pretty=format:"%H%n%an%n%s%n%n%b" > /tmp/kiro-context/commit-info.txt 2>/dev/null || printf "%s\n%s\n%s\n" "$COMMIT_ID" "$AUTHOR" "$COMMIT_MESSAGE" > /tmp/kiro-context/commit-info.txt'
-      - git diff HEAD~1..HEAD > /tmp/kiro-context/changes.diff 2>/dev/null || echo "(sem diff disponivel)" > /tmp/kiro-context/changes.diff
-      - git diff --name-only HEAD~1..HEAD > /tmp/kiro-context/changed-files.txt 2>/dev/null || echo "" > /tmp/kiro-context/changed-files.txt
+      - |
+        # Busca o diff REAL do que esta sendo promovido (develop vs main) via GitHub API,
+        # usando o PAT do GitHub. CodePipeline source nao traz historico git completo,
+        # entao git diff local nao funciona de forma confiavel para merge commits.
+        set +e
+        GH_PAT="$(aws secretsmanager get-secret-value --secret-id "$GITHUB_TOKEN_SECRET" --query SecretString --output text 2>/dev/null)"
+        set -e
+        if [ -n "$GH_PAT" ] && [ -n "$GITHUB_OWNER" ] && [ -n "$GITHUB_REPO" ]; then
+          echo "==> Fetching diff ${MAIN_BRANCH}...${SOURCE_BRANCH} via GitHub API"
+          # Compare API: base=main head=develop -> mostra o que entra em main
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/compare/${MAIN_BRANCH}...${SOURCE_BRANCH}" \
+            > /tmp/kiro-context/changes.diff 2>/dev/null || echo "(falha ao buscar diff via API)" > /tmp/kiro-context/changes.diff
+          # Lista de arquivos via API JSON
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/compare/${MAIN_BRANCH}...${SOURCE_BRANCH}" \
+            | jq -r '.files[]?.filename' > /tmp/kiro-context/changed-files.txt 2>/dev/null || echo "" > /tmp/kiro-context/changed-files.txt
+        else
+          echo "==> PAT/owner/repo ausente; tentando git diff local"
+          git diff HEAD~1..HEAD > /tmp/kiro-context/changes.diff 2>/dev/null || echo "(sem diff disponivel)" > /tmp/kiro-context/changes.diff
+          git diff --name-only HEAD~1..HEAD > /tmp/kiro-context/changed-files.txt 2>/dev/null || echo "" > /tmp/kiro-context/changed-files.txt
+        fi
+      - 'printf "%s\n%s\n%s\n" "$COMMIT_ID" "$AUTHOR" "$COMMIT_MESSAGE" > /tmp/kiro-context/commit-info.txt'
       - LINES=$(wc -l < /tmp/kiro-context/changes.diff || echo 0)
       - FILES=$(wc -l < /tmp/kiro-context/changed-files.txt || echo 0)
       - echo "==> diff lines=$LINES files=$FILES"
+      - head -20 /tmp/kiro-context/changed-files.txt
 
   build:
     commands:
