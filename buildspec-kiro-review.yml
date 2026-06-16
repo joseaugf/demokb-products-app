@@ -82,8 +82,8 @@ phases:
         EOF
       - |
         set +e
-        kiro-cli --no-interactive --trust-all-tools \
-          --prompt "$(cat /tmp/kiro-prompt.txt)" \
+        kiro-cli chat --no-interactive --trust-all-tools \
+          "$(cat /tmp/kiro-prompt.txt)" \
           > /tmp/kiro-report.md 2>&1
         EXIT=$?
         set -e
