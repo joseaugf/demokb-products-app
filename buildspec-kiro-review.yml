@@ -109,18 +109,9 @@ phases:
         set +e
         kiro-cli chat --no-interactive --trust-all-tools \
           "$(cat /tmp/kiro-prompt.txt)" \
-          2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | sed 's/\x1b\[[0-9;]*m//g' > /tmp/kiro-report-raw.md
+          2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' > /tmp/kiro-report.md
         EXIT=${PIPESTATUS[0]}
         set -e
-        # Remove linhas de banner/warning do kiro-cli (trust, MCP, credits)
-        grep -v -E '(All tools are now trusted|Learn more at|Credits:|^\s*$|^⋮|^↱|✓ Successfully|Summary:.*operations|Completed in|WARNING.*MCP|kiro.dev/docs)' /tmp/kiro-report-raw.md | sed '/^> /!d; s/^> //' > /tmp/kiro-report.md 2>/dev/null
-        # Se o filtro acima removeu tudo, usa o raw sem as primeiras linhas de banner
-        if [ ! -s /tmp/kiro-report.md ]; then
-          sed -n '/^## Sum/,$p' /tmp/kiro-report-raw.md > /tmp/kiro-report.md 2>/dev/null || true
-        fi
-        if [ ! -s /tmp/kiro-report.md ]; then
-          cp /tmp/kiro-report-raw.md /tmp/kiro-report.md
-        fi
         if [ "$EXIT" -ne 0 ]; then
           echo "==> Kiro CLI failed with exit $EXIT; building fallback report"
           mv /tmp/kiro-report.md /tmp/kiro-stderr.log || true
