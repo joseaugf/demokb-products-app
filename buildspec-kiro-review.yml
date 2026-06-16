@@ -1,6 +1,7 @@
 version: 0.2
 
 # Roda Kiro CLI em modo headless contra o diff develop -> imagem atual de qa.
+#
 # Variáveis vindas do CodeBuild Project + EnvironmentVariables override no
 # Action do CodePipeline:
 #   APP_NAME              (do project)
@@ -10,10 +11,9 @@ version: 0.2
 #   COMMIT_ID             (override do action: hash do commit)
 #   COMMIT_MESSAGE        (override do action: mensagem do commit)
 #   AUTHOR                (override do action: autor)
-#
-# Saídas:
-#   - Report markdown salvo em s3://${REPORTS_BUCKET}/reviews/${APP_NAME}/${YYYY/MM/DD}/${COMMIT_ID}.md
-#   - Stdout com sumário (visível no console CodeBuild)
+
+env:
+  shell: bash
 
 phases:
   install:
@@ -34,14 +34,11 @@ phases:
       - test -n "$KIRO_API_KEY" || { echo "KIRO_API_KEY vazio"; exit 1; }
       - echo "==> Preparing diff context"
       - mkdir -p /tmp/kiro-context
-      # CodePipeline já fez checkout do branch source (develop). Pega o diff contra qa.
-      # Como o CodePipeline não tem refs git, usamos GitHub API via PAT (lê secret do app).
-      # Para POC, vamos só pegar a lista de arquivos do commit atual.
-      - git log -1 --pretty=format:"%H%n%an%n%s%n%n%b" > /tmp/kiro-context/commit-info.txt 2>/dev/null || echo "$COMMIT_ID%n$AUTHOR%n$COMMIT_MESSAGE" > /tmp/kiro-context/commit-info.txt
-      - git diff HEAD~1..HEAD > /tmp/kiro-context/changes.diff 2>/dev/null || true
-      - git diff --name-only HEAD~1..HEAD > /tmp/kiro-context/changed-files.txt 2>/dev/null || true
-      - LINES=$(wc -l < /tmp/kiro-context/changes.diff 2>/dev/null || echo 0)
-      - FILES=$(wc -l < /tmp/kiro-context/changed-files.txt 2>/dev/null || echo 0)
+      - 'git log -1 --pretty=format:"%H%n%an%n%s%n%n%b" > /tmp/kiro-context/commit-info.txt 2>/dev/null || printf "%s\n%s\n%s\n" "$COMMIT_ID" "$AUTHOR" "$COMMIT_MESSAGE" > /tmp/kiro-context/commit-info.txt'
+      - git diff HEAD~1..HEAD > /tmp/kiro-context/changes.diff 2>/dev/null || echo "(sem diff disponivel)" > /tmp/kiro-context/changes.diff
+      - git diff --name-only HEAD~1..HEAD > /tmp/kiro-context/changed-files.txt 2>/dev/null || echo "" > /tmp/kiro-context/changed-files.txt
+      - LINES=$(wc -l < /tmp/kiro-context/changes.diff || echo 0)
+      - FILES=$(wc -l < /tmp/kiro-context/changed-files.txt || echo 0)
       - echo "==> diff lines=$LINES files=$FILES"
 
   build:
@@ -77,51 +74,55 @@ phases:
 
         ## Veredito
         Linha única no formato:
-        - VEREDITO: OK
-        - VEREDITO: WARN (motivo curto)
-        - VEREDITO: BLOCK (motivo curto)
+        - VEREDITO OK
+        - VEREDITO WARN (motivo curto)
+        - VEREDITO BLOCK (motivo curto)
 
         Seja conciso. Bullets curtos. NUNCA invente arquivos ou linhas.
         EOF
       - |
-        if kiro-cli --no-interactive --trust-all-tools \
-            --prompt "$(cat /tmp/kiro-prompt.txt)" \
-            > /tmp/kiro-report.md 2> /tmp/kiro-stderr.log; then
-          echo "==> Kiro review completed"
-        else
-          echo "::warning:: Kiro CLI failed; generating fallback report"
-          cat > /tmp/kiro-report.md <<EOF2
-        ## Sumário
-        Kiro CLI falhou ao executar. Diff de $LINES linhas em $FILES arquivos.
-
-        ## Erro
-        \`\`\`
-        $(tail -50 /tmp/kiro-stderr.log)
-        \`\`\`
-
-        ## Veredito
-        VEREDITO: WARN (kiro-cli execution failed)
-        EOF2
+        set +e
+        kiro-cli --no-interactive --trust-all-tools \
+          --prompt "$(cat /tmp/kiro-prompt.txt)" \
+          > /tmp/kiro-report.md 2>&1
+        EXIT=$?
+        set -e
+        if [ "$EXIT" -ne 0 ]; then
+          echo "==> Kiro CLI failed with exit $EXIT; building fallback report"
+          mv /tmp/kiro-report.md /tmp/kiro-stderr.log || true
+          {
+            echo "## Sumario"
+            echo ""
+            echo "Kiro CLI falhou ao executar (exit $EXIT)."
+            echo ""
+            echo "## Erro"
+            echo ""
+            echo '```'
+            tail -50 /tmp/kiro-stderr.log 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "## Veredito"
+            echo "VEREDITO WARN (kiro-cli execution failed)"
+          } > /tmp/kiro-report.md
         fi
 
   post_build:
     commands:
-      - echo "==> Uploading report to S3"
+      - echo "==> Computing S3 key"
       - DATE=$(date -u +%Y/%m/%d)
-      - SHORT_ID="${COMMIT_ID:-unknown}"
-      - SHORT_ID="${SHORT_ID:0:12}"
+      - SHORT_ID=$(printf "%s" "${COMMIT_ID:-unknown}" | cut -c 1-12)
       - KEY="reviews/${APP_NAME}/${DATE}/${SHORT_ID}.md"
       - |
         if [ -n "$REPORTS_BUCKET" ]; then
           aws s3 cp /tmp/kiro-report.md "s3://${REPORTS_BUCKET}/${KEY}"
-          echo "==> Report URL: https://s3.${AWS_DEFAULT_REGION}.amazonaws.com/${REPORTS_BUCKET}/${KEY}"
+          echo "==> Report URL https://s3.${AWS_DEFAULT_REGION}.amazonaws.com/${REPORTS_BUCKET}/${KEY}"
         else
           echo "==> REPORTS_BUCKET not set; skipping S3 upload"
         fi
       - |
-        echo "==> Veredito:"
-        grep -oE 'VEREDITO: (OK|WARN|BLOCK)[^$]*' /tmp/kiro-report.md | head -1 || echo "VEREDITO: WARN (no veredito found)"
-        echo "==> First 80 lines of report:"
+        echo "==> Veredito"
+        grep -oE 'VEREDITO (OK|WARN|BLOCK)[^$]*' /tmp/kiro-report.md | head -1 || echo "VEREDITO WARN (no veredito found)"
+        echo "==> First 80 lines of report"
         head -80 /tmp/kiro-report.md
 
 artifacts:
