@@ -1,0 +1,207 @@
+name: Approval Bridge
+
+# Polling do CodePipeline AWS:
+# - Roda a cada 5 minutos (cron) e on-demand (workflow_dispatch).
+# - Lista todos os pipelines demokb-* e procura approvals em estado "InProgress".
+# - Para cada approval pendente, dispara o deployment no Environment correspondente:
+#     stage Approval_To_QA          -> Environment qa
+#     stage Approval_To_Main_PR     -> Environment prod
+#     stage Approval_Hotfix_Prod    -> Environment prod-hotfix
+#     stage Approval_Rollback       -> Environment prod-rollback
+# - Quando o reviewer aprovar no GitHub, este mesmo workflow chama
+#   put-approval-result e o CodePipeline destrava.
+#
+# Como o GitHub Environment requer um job para gateá-lo, o workflow usa
+# matrix dinamica: o job "discover" descobre os approvals pendentes e o
+# job "approve" entra em cada Environment correspondente.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # a cada 5 minutos
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  REPO_NAME: ${{ github.event.repository.name }}
+
+concurrency:
+  group: approval-bridge-${{ github.event.repository.name }}
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      pending_json: ${{ steps.scan.outputs.pending_json }}
+      has_pending: ${{ steps.scan.outputs.has_pending }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Scan pending approvals on this app's pipelines
+        id: scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          PIPELINES=("${REPO_NAME}-devqa" "${REPO_NAME}-hotfix")
+          PENDING="[]"
+          for PIPELINE in "${PIPELINES[@]}"; do
+            if ! aws codepipeline get-pipeline --name "$PIPELINE" >/dev/null 2>&1; then
+              echo "Pipeline $PIPELINE not found; skipping"
+              continue
+            fi
+            STATE=$(aws codepipeline get-pipeline-state --name "$PIPELINE" --output json)
+            ECHO=$(echo "$STATE" | jq --arg pl "$PIPELINE" '
+              [ .stageStates[]
+                | select(.actionStates // [] | any(.latestExecution.status == "InProgress" and (.actionTypeId // {} | .category // "" == "Approval")
+                          or (.actionName // "" | startswith("Manual_Approval"))))
+                | { pipeline: $pl,
+                    stage: .stageName,
+                    action: (.actionStates[] | select(.latestExecution.status == "InProgress" and ((.actionName // "") | startswith("Manual_Approval"))) | .actionName),
+                    token:  (.actionStates[] | select(.latestExecution.status == "InProgress" and ((.actionName // "") | startswith("Manual_Approval"))) | .latestExecution.token)
+                  }
+              ]
+            ')
+            PENDING=$(echo "$PENDING $ECHO" | jq -s 'add')
+          done
+          echo "Pending approvals:"
+          echo "$PENDING" | jq .
+          # Mapeia stage -> environment
+          MAPPED=$(echo "$PENDING" | jq '[ .[] | . + {
+            environment: (
+              if .stage == "Approval_To_QA"        then "qa"
+              elif .stage == "Approval_To_Main_PR" then "prod"
+              elif .stage == "Approval_Hotfix_Prod" then "prod-hotfix"
+              elif .stage == "Approval_Rollback"   then "prod-rollback"
+              else "qa" end
+            )
+          } ]')
+          # Compacta para uma linha
+          ONELINE=$(echo "$MAPPED" | jq -c .)
+          echo "pending_json=$ONELINE" >> "$GITHUB_OUTPUT"
+          if [[ "$(echo "$MAPPED" | jq 'length')" -gt 0 ]]; then
+            echo "has_pending=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pending=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Um job por approval pendente. Cada um trava em seu Environment até reviewer aprovar.
+  approve-qa:
+    needs: discover
+    if: needs.discover.outputs.has_pending == 'true' && contains(needs.discover.outputs.pending_json, '"environment":"qa"')
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send Approved to CodePipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          PENDING='${{ needs.discover.outputs.pending_json }}'
+          ITEM=$(echo "$PENDING" | jq -c '.[] | select(.environment == "qa")' | head -1)
+          [ -n "$ITEM" ] || { echo "::warning::Nenhum item qa em pending"; exit 0; }
+          PIPELINE=$(echo "$ITEM" | jq -r '.pipeline')
+          STAGE=$(echo "$ITEM" | jq -r '.stage')
+          ACTION=$(echo "$ITEM" | jq -r '.action')
+          TOKEN=$(echo "$ITEM" | jq -r '.token')
+          echo "Approving: pipeline=$PIPELINE stage=$STAGE action=$ACTION"
+          aws codepipeline put-approval-result \
+            --pipeline-name "$PIPELINE" \
+            --stage-name "$STAGE" \
+            --action-name "$ACTION" \
+            --token "$TOKEN" \
+            --result "summary=Approved by ${{ github.actor }} via GitHub Environment qa,status=Approved"
+
+  approve-prod:
+    needs: discover
+    if: needs.discover.outputs.has_pending == 'true' && contains(needs.discover.outputs.pending_json, '"environment":"prod"')
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send Approved to CodePipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          PENDING='${{ needs.discover.outputs.pending_json }}'
+          ITEM=$(echo "$PENDING" | jq -c '.[] | select(.environment == "prod")' | head -1)
+          [ -n "$ITEM" ] || { echo "::warning::Nenhum item prod em pending"; exit 0; }
+          PIPELINE=$(echo "$ITEM" | jq -r '.pipeline')
+          STAGE=$(echo "$ITEM" | jq -r '.stage')
+          ACTION=$(echo "$ITEM" | jq -r '.action')
+          TOKEN=$(echo "$ITEM" | jq -r '.token')
+          echo "Approving: pipeline=$PIPELINE stage=$STAGE action=$ACTION"
+          aws codepipeline put-approval-result \
+            --pipeline-name "$PIPELINE" \
+            --stage-name "$STAGE" \
+            --action-name "$ACTION" \
+            --token "$TOKEN" \
+            --result "summary=Approved by ${{ github.actor }} via GitHub Environment prod,status=Approved"
+
+  approve-prod-hotfix:
+    needs: discover
+    if: needs.discover.outputs.has_pending == 'true' && contains(needs.discover.outputs.pending_json, '"environment":"prod-hotfix"')
+    runs-on: ubuntu-latest
+    environment: prod-hotfix
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send Approved to CodePipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          PENDING='${{ needs.discover.outputs.pending_json }}'
+          ITEM=$(echo "$PENDING" | jq -c '.[] | select(.environment == "prod-hotfix")' | head -1)
+          [ -n "$ITEM" ] || { echo "::warning::Nenhum item prod-hotfix em pending"; exit 0; }
+          PIPELINE=$(echo "$ITEM" | jq -r '.pipeline')
+          STAGE=$(echo "$ITEM" | jq -r '.stage')
+          ACTION=$(echo "$ITEM" | jq -r '.action')
+          TOKEN=$(echo "$ITEM" | jq -r '.token')
+          aws codepipeline put-approval-result \
+            --pipeline-name "$PIPELINE" \
+            --stage-name "$STAGE" \
+            --action-name "$ACTION" \
+            --token "$TOKEN" \
+            --result "summary=Approved by ${{ github.actor }} via GitHub Environment prod-hotfix,status=Approved"
+
+  approve-prod-rollback:
+    needs: discover
+    if: needs.discover.outputs.has_pending == 'true' && contains(needs.discover.outputs.pending_json, '"environment":"prod-rollback"')
+    runs-on: ubuntu-latest
+    environment: prod-rollback
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send Approved to CodePipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          PENDING='${{ needs.discover.outputs.pending_json }}'
+          ITEM=$(echo "$PENDING" | jq -c '.[] | select(.environment == "prod-rollback")' | head -1)
+          [ -n "$ITEM" ] || { echo "::warning::Nenhum item prod-rollback em pending"; exit 0; }
+          PIPELINE=$(echo "$ITEM" | jq -r '.pipeline')
+          STAGE=$(echo "$ITEM" | jq -r '.stage')
+          ACTION=$(echo "$ITEM" | jq -r '.action')
+          TOKEN=$(echo "$ITEM" | jq -r '.token')
+          aws codepipeline put-approval-result \
+            --pipeline-name "$PIPELINE" \
+            --stage-name "$STAGE" \
+            --action-name "$ACTION" \
+            --token "$TOKEN" \
+            --result "summary=Approved by ${{ github.actor }} via GitHub Environment prod-rollback,status=Approved"
