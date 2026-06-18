@@ -1,10 +1,11 @@
-# Usado pelo CodeBuild em TODOS os estágios do pipeline.
-# Variáveis esperadas (setadas no CodePipeline/CodeBuild):
+# Build único, imutável. Roda SEM conhecer o ambiente de destino.
+# O mesmo imagedefinitions.json é consumido pelas ações de deploy em dev, qa e prod.
+#
+# Variáveis esperadas (setadas no CodeBuild Project):
 #   AWS_DEFAULT_REGION    (ex.: us-east-1)
 #   AWS_ACCOUNT_ID
-#   IMAGE_REPO_NAME       (nome do repo ECR, ex.: products-app)
+#   IMAGE_REPO_NAME       (nome do repo ECR, ex.: demokb-products-app)
 #   CONTAINER_NAME        (nome do container na task def, ex.: app)
-#   TARGET_ENV            (dev | qa | prod) - usado como tag adicional e APP_ENV
 version: 0.2
 
 phases:
@@ -16,27 +17,25 @@ phases:
       - COMMIT_HASH=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-7)
       - IMAGE_TAG=${COMMIT_HASH:=latest}
       - REPOSITORY_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME"
-      - echo "REPOSITORY_URI=$REPOSITORY_URI"
-      - echo "IMAGE_TAG=$IMAGE_TAG  TARGET_ENV=$TARGET_ENV"
+      - echo "REPOSITORY_URI=$REPOSITORY_URI  IMAGE_TAG=$IMAGE_TAG"
 
   build:
     commands:
       - echo "[build] Building Docker image..."
       - docker build -t "$REPOSITORY_URI:$IMAGE_TAG" .
-      - docker tag "$REPOSITORY_URI:$IMAGE_TAG" "$REPOSITORY_URI:$TARGET_ENV"
+      # Tags adicionais para rastreabilidade (não são usadas pelo deploy)
+      - docker tag "$REPOSITORY_URI:$IMAGE_TAG" "$REPOSITORY_URI:latest"
 
   post_build:
     commands:
       - echo "[post_build] Pushing image to ECR..."
       - docker push "$REPOSITORY_URI:$IMAGE_TAG"
-      - docker push "$REPOSITORY_URI:$TARGET_ENV"
-      - echo "[post_build] Writing imagedefinitions.json for ECS deploy action..."
+      - docker push "$REPOSITORY_URI:latest"
+      - echo "[post_build] Writing imagedefinitions.json (same artifact for dev/qa/prod)..."
       - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$REPOSITORY_URI:$IMAGE_TAG" > imagedefinitions.json
       - cat imagedefinitions.json
 
 artifacts:
   files:
     - imagedefinitions.json
-    - appspec.yaml
-    - taskdef.json
   discard-paths: yes

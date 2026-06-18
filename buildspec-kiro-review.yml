@@ -1,0 +1,186 @@
+version: 0.2
+
+# Roda Kiro CLI em modo headless contra o diff develop -> imagem atual de qa.
+#
+# Variáveis vindas do CodeBuild Project + EnvironmentVariables override no
+# Action do CodePipeline:
+#   APP_NAME              (do project)
+#   AWS_DEFAULT_REGION    (do project)
+#   KIRO_API_KEY_SECRET   (ARN do secret no Secrets Manager)
+#   REPORTS_BUCKET        (nome do bucket S3 onde subir o report)
+#   COMMIT_ID             (override do action: hash do commit)
+#   COMMIT_MESSAGE        (override do action: mensagem do commit)
+#   AUTHOR                (override do action: autor)
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - echo "==> Installing Kiro CLI"
+      - curl -fsSL https://cli.kiro.dev/install -o /tmp/kiro-install.sh
+      - bash /tmp/kiro-install.sh
+      - export PATH="$HOME/.local/bin:$PATH"
+      - which kiro-cli || { echo "kiro-cli nao foi instalado"; exit 1; }
+      - kiro-cli --version
+
+  pre_build:
+    commands:
+      - echo "==> Loading Kiro API key"
+      - export KIRO_API_KEY="$(aws secretsmanager get-secret-value --secret-id "$KIRO_API_KEY_SECRET" --query SecretString --output text)"
+      - test -n "$KIRO_API_KEY" || { echo "KIRO_API_KEY vazio"; exit 1; }
+      - echo "==> Preparing diff context"
+      - mkdir -p /tmp/kiro-context
+      - |
+        # Busca o diff REAL do que esta sendo promovido (develop vs main) via GitHub API,
+        # usando o PAT do GitHub. CodePipeline source nao traz historico git completo,
+        # entao git diff local nao funciona de forma confiavel para merge commits.
+        set +e
+        GH_PAT="$(aws secretsmanager get-secret-value --secret-id "$GITHUB_TOKEN_SECRET" --query SecretString --output text 2>/dev/null)"
+        set -e
+        if [ -n "$GH_PAT" ] && [ -n "$GITHUB_OWNER" ] && [ -n "$GITHUB_REPO" ]; then
+          echo "==> Fetching diff ${MAIN_BRANCH}...${SOURCE_BRANCH} via GitHub API"
+          # Compare API: base=main head=develop -> mostra o que entra em main
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/compare/${MAIN_BRANCH}...${SOURCE_BRANCH}" \
+            > /tmp/kiro-context/changes.diff 2>/dev/null || echo "(falha ao buscar diff via API)" > /tmp/kiro-context/changes.diff
+          # Lista de arquivos via API JSON
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/compare/${MAIN_BRANCH}...${SOURCE_BRANCH}" \
+            | jq -r '.files[]?.filename' > /tmp/kiro-context/changed-files.txt 2>/dev/null || echo "" > /tmp/kiro-context/changed-files.txt
+        else
+          echo "==> PAT/owner/repo ausente; tentando git diff local"
+          git diff HEAD~1..HEAD > /tmp/kiro-context/changes.diff 2>/dev/null || echo "(sem diff disponivel)" > /tmp/kiro-context/changes.diff
+          git diff --name-only HEAD~1..HEAD > /tmp/kiro-context/changed-files.txt 2>/dev/null || echo "" > /tmp/kiro-context/changed-files.txt
+        fi
+      - 'printf "%s\n%s\n%s\n" "$COMMIT_ID" "$AUTHOR" "$COMMIT_MESSAGE" > /tmp/kiro-context/commit-info.txt'
+      - LINES=$(wc -l < /tmp/kiro-context/changes.diff || echo 0)
+      - FILES=$(wc -l < /tmp/kiro-context/changed-files.txt || echo 0)
+      - echo "==> diff lines=$LINES files=$FILES"
+      - head -20 /tmp/kiro-context/changed-files.txt
+
+  build:
+    commands:
+      - echo "==> Running Kiro headless review"
+      - |
+        cat > /tmp/kiro-prompt.txt <<'EOF'
+        Você é um senior software engineer fazendo code review automatizado de um deploy
+        que está prestes a ir para QA.
+
+        Contexto disponível:
+        - /tmp/kiro-context/commit-info.txt — autor, hash, mensagem do commit
+        - /tmp/kiro-context/changes.diff    — diff completo
+        - /tmp/kiro-context/changed-files.txt — lista de arquivos alterados
+
+        Produza um relatório em **markdown** com as seguintes seções, nessa ordem:
+
+        ## Sumário
+        1-2 parágrafos com o que mudou e por quê.
+
+        ## Bugs potenciais
+        Até 5 problemas que podem causar bug em produção. Cite arquivo:linha.
+        Se nada relevante: "Nenhum encontrado.".
+
+        ## Segurança
+        Vulnerabilidades, secrets expostos, validação de input.
+
+        ## Cobertura de testes
+        "OK", "Parcial" ou "Insuficiente" + motivo.
+
+        ## Sugestões de melhoria
+        Até 3 itens curtos. Não invente.
+
+        ## Veredito
+        Linha única no formato:
+        - VEREDITO OK
+        - VEREDITO WARN (motivo curto)
+        - VEREDITO BLOCK (motivo curto)
+
+        Seja conciso. Bullets curtos. NUNCA invente arquivos ou linhas.
+        EOF
+      - |
+        set +e
+        kiro-cli chat --no-interactive --trust-all-tools \
+          "$(cat /tmp/kiro-prompt.txt)" \
+          2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' > /tmp/kiro-report.md
+        EXIT=${PIPESTATUS[0]}
+        set -e
+        if [ "$EXIT" -ne 0 ]; then
+          echo "==> Kiro CLI failed with exit $EXIT; building fallback report"
+          mv /tmp/kiro-report.md /tmp/kiro-stderr.log || true
+          {
+            echo "## Sumario"
+            echo ""
+            echo "Kiro CLI falhou ao executar (exit $EXIT)."
+            echo ""
+            echo "## Erro"
+            echo ""
+            echo '```'
+            tail -50 /tmp/kiro-stderr.log 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "## Veredito"
+            echo "VEREDITO WARN (kiro-cli execution failed)"
+          } > /tmp/kiro-report.md
+        fi
+
+  post_build:
+    commands:
+      - echo "==> Computing S3 key"
+      - DATE=$(date -u +%Y/%m/%d)
+      - SHORT_ID=$(printf "%s" "${COMMIT_ID:-unknown}" | cut -c 1-12)
+      - KEY="reviews/${APP_NAME}/${DATE}/${SHORT_ID}.md"
+      - |
+        if [ -n "$REPORTS_BUCKET" ]; then
+          aws s3 cp /tmp/kiro-report.md "s3://${REPORTS_BUCKET}/${KEY}"
+          echo "==> Report uploaded to s3://${REPORTS_BUCKET}/${KEY}"
+        else
+          echo "==> REPORTS_BUCKET not set; skipping S3 upload"
+        fi
+      - |
+        echo "==> Veredito"
+        grep -oE 'VEREDITO (OK|WARN|BLOCK)[^$]*' /tmp/kiro-report.md | head -1 || echo "VEREDITO WARN (no veredito found)"
+        echo "==> First 80 lines of report"
+        head -80 /tmp/kiro-report.md
+      - |
+        echo "==> Posting Kiro review as PR comment on GitHub"
+        GH_PAT="$(aws secretsmanager get-secret-value --secret-id "$GITHUB_TOKEN_SECRET" --query SecretString --output text 2>/dev/null || true)"
+        if [ -z "$GH_PAT" ] || [ -z "$GITHUB_OWNER" ] || [ -z "$GITHUB_REPO" ]; then
+          echo "==> PAT/owner/repo ausente; skip comment"
+          exit 0
+        fi
+        PR_NUM=$(curl -fsSL \
+          -H "Authorization: Bearer ${GH_PAT}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls?state=all&base=${SOURCE_BRANCH}&sort=updated&direction=desc&per_page=1" \
+          | jq -r '.[0].number // empty')
+        if [ -z "$PR_NUM" ]; then
+          echo "==> No recent PR found"
+          exit 0
+        fi
+        REPORT_CONTENT=$(head -200 /tmp/kiro-report.md)
+        python3 -c "
+        import json, sys
+        report = open('/tmp/kiro-report.md').read()[:8000]
+        body = '## 🤖 Kiro Review (pipeline deploy)\n\n' + report
+        body += '\n\n---\n[Report completo no S3](https://s3.${AWS_DEFAULT_REGION}.amazonaws.com/${REPORTS_BUCKET}/${KEY})'
+        json.dump({'body': body}, open('/tmp/comment-body.json','w'))
+        "
+        curl -fsSL -X POST \
+          -H "Authorization: Bearer ${GH_PAT}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/issues/${PR_NUM}/comments" \
+          -d @/tmp/comment-body.json > /dev/null && echo "==> Commented on PR #${PR_NUM}" || echo "==> Failed to comment (non-blocking)"
+
+artifacts:
+  files:
+    - /tmp/kiro-report.md
+  name: kiro-review-report
+  discard-paths: yes
