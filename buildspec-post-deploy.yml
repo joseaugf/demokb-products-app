@@ -1,0 +1,91 @@
+version: 0.2
+
+# Post Deploy: ações pós-deploy por tipo de operação.
+# - Feature: noop (PR develop→main já é criado por Open_PR Lambda no modelo antigo;
+#   na unificada o approval-bridge pode fazer isso)
+# - Hotfix: cria PR backmerge main→develop via GitHub API
+# - Rollback: cria git tag rollback-to-<tag>-<date>
+
+env:
+  shell: bash
+
+phases:
+  build:
+    commands:
+      - OPERATION="${OPERATION:-feature}"
+      - echo "==> Post Deploy (operation=$OPERATION)"
+      - |
+        GH_PAT=$(aws secretsmanager get-secret-value --secret-id "$GITHUB_TOKEN_SECRET" --query SecretString --output text 2>/dev/null || true)
+      - |
+        case "$OPERATION" in
+          feature)
+            echo "==> Feature: noop post-deploy (PR develop->main handled by approval flow)"
+            ;;
+          hotfix)
+            echo "==> Hotfix: creating backmerge PR main -> develop"
+            if [ -z "$GH_PAT" ]; then
+              echo "WARN: no PAT, skipping backmerge"
+              exit 0
+            fi
+            BODY=$(python3 -c "
+        import json
+        json.dump({
+            'title': 'backmerge: hotfix (main -> develop)',
+            'head': '${MAIN_BRANCH:-main}',
+            'base': '${SOURCE_BRANCH_DEFAULT:-develop}',
+            'body': 'PR automatico de back-merge apos hotfix em prod.'
+        }, open('/tmp/pr-body.json','w'))
+        ")
+            RESP=$(curl -fsSL -X POST \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/pulls" \
+              -d @/tmp/pr-body.json -w "\n%{http_code}" 2>&1 || true)
+            echo "    Backmerge response: $(echo "$RESP" | tail -1)"
+            ;;
+          rollback)
+            echo "==> Rollback: creating git tag"
+            if [ -z "$GH_PAT" ]; then
+              echo "WARN: no PAT, skipping tag"
+              exit 0
+            fi
+            DATE=$(date -u +%Y%m%d-%H%M%S)
+            TAG_NAME="rollback-to-${IMAGE_TAG}-${DATE}"
+            # Pega SHA de main pra taggear
+            MAIN_SHA=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/ref/heads/${MAIN_BRANCH:-main}" \
+              | jq -r '.object.sha')
+            # Cria tag
+            python3 -c "
+        import json
+        json.dump({
+            'tag': '${TAG_NAME}',
+            'message': 'Rollback prod to ${IMAGE_TAG} on ${DATE}',
+            'object': '${MAIN_SHA}',
+            'type': 'commit'
+        }, open('/tmp/tag-body.json','w'))
+        "
+            curl -fsSL -X POST \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/tags" \
+              -d @/tmp/tag-body.json > /dev/null
+            # Cria ref
+            python3 -c "
+        import json
+        json.dump({'ref': 'refs/tags/${TAG_NAME}', 'sha': '${MAIN_SHA}'}, open('/tmp/ref-body.json','w'))
+        "
+            curl -fsSL -X POST \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/git/refs" \
+              -d @/tmp/ref-body.json > /dev/null
+            echo "    Tag created: $TAG_NAME"
+            ;;
+        esac
+      - echo "==> Post Deploy done"
+
+artifacts:
+  files: []
