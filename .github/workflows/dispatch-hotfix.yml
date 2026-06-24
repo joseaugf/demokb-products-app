@@ -1,0 +1,51 @@
+name: Dispatch Hotfix
+
+# Dispara a pipeline unificada com Operation=hotfix.
+# O dev cria a branch hotfix/<descricao> de main, faz o fix, e roda este workflow.
+# A pipeline builda da branch hotfix, aprova direto pra prod, e faz back-merge.
+
+on:
+  workflow_dispatch:
+    inputs:
+      hotfix_branch:
+        description: "Nome da branch hotfix (ex: hotfix/fix-critico)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  REPO_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start hotfix pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXEC=$(aws codepipeline start-pipeline-execution \
+            --name "${REPO_NAME}-pipeline" \
+            --variables \
+              "name=Operation,value=hotfix" \
+              "name=SourceBranch,value=${{ inputs.hotfix_branch }}" \
+              "name=ImageTag,value=none" \
+            --query 'pipelineExecutionId' --output text)
+          echo "## Hotfix disparado" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Pipeline: ${REPO_NAME}-pipeline" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Operation: hotfix" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: ${{ inputs.hotfix_branch }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Execution: $EXEC" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [Ver no console](https://${AWS_REGION}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${REPO_NAME}-pipeline/executions/${EXEC}/timeline)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Aguarde a Approval ficar pendente e aprove no Environment **prod-hotfix**." >> "$GITHUB_STEP_SUMMARY"
