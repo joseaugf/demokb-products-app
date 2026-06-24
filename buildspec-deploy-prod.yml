@@ -1,0 +1,38 @@
+version: 0.2
+
+# Deploy Prod: atualiza o ECS service de prod.
+# - Feature/Hotfix: usa a imagem buildada nesta execução (tag = commit SHA)
+# - Rollback: usa RESOLVED_IMAGE (tag passada como variável)
+
+env:
+  shell: bash
+
+phases:
+  build:
+    commands:
+      - OPERATION="${OPERATION:-feature}"
+      - echo "==> Deploy Prod (operation=$OPERATION)"
+      - |
+        if [ "$OPERATION" = "rollback" ]; then
+          IMAGE="$RESOLVED_IMAGE"
+        else
+          REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" --query 'repositories[0].repositoryUri' --output text)
+          TAG=$(git rev-parse HEAD | cut -c 1-12)
+          IMAGE="${REPO_URI}:${TAG}"
+        fi
+      - echo "    Image=$IMAGE Service=${APP_NAME}-prod"
+      - |
+        CURRENT_TD=$(aws ecs describe-task-definition --task-definition "${APP_NAME}-prod" --query 'taskDefinition' --output json)
+        NEW_TD=$(echo "$CURRENT_TD" | jq --arg img "$IMAGE" --arg cn "$CONTAINER_NAME" '
+          .containerDefinitions |= map(if .name == $cn then .image = $img else . end)
+          | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+        ')
+        echo "$NEW_TD" > /tmp/td.json
+        NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td.json --query 'taskDefinition.taskDefinitionArn' --output text)
+        aws ecs update-service --cluster "$CLUSTER_NAME" --service "${APP_NAME}-prod" --task-definition "$NEW_ARN" --output table
+      - echo "==> Waiting for prod service to stabilize..."
+      - aws ecs wait services-stable --cluster "$CLUSTER_NAME" --services "${APP_NAME}-prod"
+      - echo "==> Prod deploy complete"
+
+artifacts:
+  files: []

@@ -8,9 +8,19 @@
 #   CONTAINER_NAME        (nome do container na task def, ex.: app)
 version: 0.2
 
+env:
+  shell: bash
+
 phases:
   pre_build:
     commands:
+      - OPERATION="${OPERATION:-feature}"
+      - |
+        if [ "$OPERATION" = "rollback" ]; then
+          echo "==> SKIP Build (operation=rollback, usa imagem existente)"
+          mkdir -p /tmp/out && echo '[]' > /tmp/out/imagedefinitions.json
+          exit 0
+        fi
       - echo "[pre_build] Logging in to Amazon ECR..."
       - aws --version
       - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"

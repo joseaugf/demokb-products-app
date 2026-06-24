@@ -1,0 +1,59 @@
+version: 0.2
+
+# Router: primeiro stage da pipeline unificada.
+# Lê as variáveis de execução (OPERATION, IMAGE_TAG, SOURCE_BRANCH),
+# valida pré-condições e prepara o diretório de trabalho.
+#
+# Se Operation=hotfix/rollback, faz git fetch da branch correta
+# (porque Source sempre puxa develop pra ter os buildspecs).
+
+env:
+  shell: bash
+  exported-variables:
+    - OPERATION
+    - IMAGE_TAG
+    - SOURCE_BRANCH
+    - RESOLVED_IMAGE
+
+phases:
+  build:
+    commands:
+      - echo "==> Router"
+      - echo "    OPERATION=${OPERATION:-feature}"
+      - echo "    IMAGE_TAG=${IMAGE_TAG:-}"
+      - echo "    SOURCE_BRANCH=${SOURCE_BRANCH:-develop}"
+      - OPERATION="${OPERATION:-feature}"
+      - SOURCE_BRANCH="${SOURCE_BRANCH:-develop}"
+      - |
+        case "$OPERATION" in
+          feature)
+            echo "==> Feature flow. Source already on develop."
+            ;;
+          hotfix)
+            echo "==> Hotfix flow. Fetching branch hotfix..."
+            git fetch origin "${SOURCE_BRANCH}" --depth=1
+            git checkout FETCH_HEAD
+            echo "    Checked out ${SOURCE_BRANCH}"
+            ;;
+          rollback)
+            echo "==> Rollback flow."
+            if [ -z "$IMAGE_TAG" ]; then
+              echo "ERROR: IMAGE_TAG is required for rollback"
+              exit 1
+            fi
+            echo "    Validating image tag exists in ECR..."
+            aws ecr describe-images --repository-name "$APP_NAME" --image-ids imageTag="$IMAGE_TAG" > /dev/null
+            REPO_URI=$(aws ecr describe-repositories --repository-names "$APP_NAME" --query 'repositories[0].repositoryUri' --output text)
+            RESOLVED_IMAGE="${REPO_URI}:${IMAGE_TAG}"
+            echo "    RESOLVED_IMAGE=$RESOLVED_IMAGE"
+            ;;
+          *)
+            echo "ERROR: OPERATION must be feature|hotfix|rollback, got: $OPERATION"
+            exit 1
+            ;;
+        esac
+      - echo "==> Router done. operation=$OPERATION"
+
+artifacts:
+  files:
+    - '**/*'
